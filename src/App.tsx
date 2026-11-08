@@ -154,7 +154,7 @@ function App() {
     <div className="app-shell">
       <aside className={`sidebar ${mobileNav ? "sidebar-open" : ""}`}>
         <a className="brand" href="#" onClick={(event) => { event.preventDefault(); setScreen("dashboard"); }}>
-          <span className="brand-mark"><Activity size={19} strokeWidth={2.5} /></span>
+          <span className="brand-mark"><img src="/driftwatch-logo.png" alt="" /></span>
           <span>drift<span className="brand-light">watch</span></span>
           <span className="brand-version">BETA</span>
         </a>

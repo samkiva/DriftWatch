@@ -54,6 +54,8 @@ npm test
 npm run test:e2e
 ```
 
+GitHub Actions runs the production build, unit tests, and Chromium end-to-end tests on pushes and pull requests targeting `main`, using Node.js 22 and `npm ci`. The opt-in near-limit upload benchmark is not enabled in CI.
+
 Unit tests cover parsing/validation, detected delimiters and quotes, large cells, data types, exact and reconciled matching, ambiguous/duplicate/missing/conflicting identifiers and mappings, all record change types, schema changes, exports (including formula and HTML injection), profiling, fingerprints, significance and movement analytics, and the 100-versus-1,000 positional-index regression. Playwright covers upload, profile, explicit key confirmation, reconciliation and export, Worker failure cleanup, and synthetic 1k/10k/50k/100k comparison benchmarks; install Chromium once with `npx playwright install chromium` if needed. Run the 120 MB worker parse/profile/fingerprint benchmark separately with `RUN_LIMIT_BENCHMARK=1 npm run test:e2e -- --grep "near-limit CSV"`. It is opt-in because it requires substantial browser memory. Browser `performance.memory` snapshots cover the renderer and do not measure Worker memory; results depend on browser and hardware.
 
 ## Current limits

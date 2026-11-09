@@ -1,5 +1,5 @@
 import Papa from "papaparse";
-import { parseFileInWorker } from "./worker-client";
+import { parseFileInWorker, type WorkerRequestOptions } from "./worker-client";
 
 export type CellValue = string;
 export type DataType = "text" | "number" | "date" | "boolean" | "empty";
@@ -78,12 +78,12 @@ export function parseCsv(contents: string, name = "dataset.csv"): Dataset {
   return { name, headers, rows, types };
 }
 
-export async function readCsvFile(file: File): Promise<Dataset> {
+export async function readCsvFile(file: File, options?: WorkerRequestOptions): Promise<Dataset> {
   if (!/\.csv$/i.test(file.name) && file.type !== "text/csv") {
     throw new CsvValidationError("Choose a .csv file to continue.");
   }
   if (file.size > 150_000_000) {
     throw new CsvValidationError("This file exceeds the 150 MB in-browser limit.");
   }
-  return parseFileInWorker(file);
+  return parseFileInWorker(file, options);
 }

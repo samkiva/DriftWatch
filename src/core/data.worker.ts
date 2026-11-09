@@ -18,6 +18,7 @@ type CompactComparisonResult = Omit<ComparisonResult, "baseline" | "newer" | "re
 };
 
 type WorkerResponse =
+  | { type: "progress"; stage: string; percent: number }
   | { type: "parsed"; dataset: Dataset & { fingerprint: string; profile: DatasetProfile } }
   | { type: "compared"; result: CompactComparisonResult }
   | { type: "identifiers-ranked"; candidates: ReturnType<typeof rankIdentifierCandidates> }
@@ -30,13 +31,20 @@ interface WorkerScope {
 
 const workerScope = self as unknown as WorkerScope;
 
+function reportProgress(stage: string, percent: number) {
+  workerScope.postMessage({ type: "progress", stage, percent });
+}
+
 async function parseContents(contents: string, name: string): Promise<WorkerResponse> {
+  reportProgress("Parsing CSV rows", 28);
   const parsed = parseCsv(contents, name);
+  reportProgress("Profiling and fingerprinting", 68);
   const [fingerprint, baseProfile] = await Promise.all([
     fingerprintDataset(parsed),
     Promise.resolve(profileDataset(parsed)),
   ]);
   const profile: DatasetProfile = { ...baseProfile, fingerprint };
+  reportProgress("Finalizing dataset", 94);
   return { type: "parsed", dataset: { ...parsed, fingerprint, profile } };
 }
 
@@ -45,8 +53,12 @@ workerScope.addEventListener("message", async ({ data }) => {
     let response: WorkerResponse;
     if (data.type === "parse-file") {
       if (data.file.size > 150_000_000) throw new Error("This file exceeds the 150 MB in-browser limit.");
-      response = await parseContents(await data.file.text(), data.file.name);
+      reportProgress("Reading file locally", 8);
+      const contents = await data.file.text();
+      reportProgress("File ready; preparing CSV", 20);
+      response = await parseContents(contents, data.file.name);
     } else if (data.type === "parse-text") {
+      reportProgress("Preparing CSV", 12);
       response = await parseContents(data.contents, data.name);
     } else if (data.type === "rank-identifiers") {
       response = {
@@ -54,7 +66,9 @@ workerScope.addEventListener("message", async ({ data }) => {
         candidates: rankIdentifierCandidates(data.baseline, data.newer),
       };
     } else {
+      reportProgress("Comparing matched records", 12);
       const fullResult = compareDatasets(data.baseline, data.newer, data.identifier, data.options);
+      reportProgress("Preparing comparison summary", 92);
       response = {
         type: "compared",
         result: {

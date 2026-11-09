@@ -1,6 +1,6 @@
 # DriftWatch
 
-DriftWatch is a privacy-first CSV comparison tool. It processes files entirely in your browser: CSV contents are not uploaded, sent to an API, or persisted to browser storage.
+DriftWatch is a privacy-first CSV comparison tool. It processes files entirely in your browser: CSV contents are not uploaded or sent to an API. Comparisons are not persisted unless you explicitly save one.
 
 ## Run locally
 
@@ -40,12 +40,15 @@ File parsing, profiling, fingerprinting, candidate ranking, and comparison run i
 - `src/core/export.ts`: CSV and self-contained HTML report generation.
 - `src/core/profile.ts`: deterministic missingness, duplicate, email, date, outlier, and category profiling.
 - `src/core/fingerprint.ts`: canonical content SHA-256 fingerprinting.
+- `src/core/saved-comparisons.ts`: explicit browser-local persistence in IndexedDB.
 - `src/core/data.worker.ts` and `src/core/worker-client.ts`: browser-only background parsing, profiling, fingerprinting, and comparison.
 - `src/components/ChangeChart.tsx`: lazily loaded comparison chart.
 - `src/App.tsx`: upload flow, overview dashboard, explorer, export controls, and about page.
 - `src/styles.css`: responsive dark interface and Tailwind entry point.
 
-Datasets stay in page memory. Starting a new comparison clears the previous result; refreshing the tab also clears uploaded data. No authentication or server is required.
+Uploaded datasets stay in page memory by default. From a completed result, users may explicitly save a comparison to IndexedDB on this device and reopen or delete it later from **Saved comparisons**. Saved datasets remain in this browser until deleted or site data is cleared; they are never uploaded. Browser storage quotas apply. No authentication or server is required.
+
+Uploads and comparisons run in workers with stage progress and cancel controls. Cancelling terminates the active worker; CSV parsing itself reports phase progress rather than byte-accurate progress.
 
 ## Tests
 
@@ -56,12 +59,13 @@ npm run test:e2e
 
 GitHub Actions runs the production build, unit tests, and Chromium end-to-end tests on pushes and pull requests targeting `main`, using Node.js 22 and `npm ci`. The opt-in near-limit upload benchmark is not enabled in CI.
 
-Unit tests cover parsing/validation, detected delimiters and quotes, large cells, data types, exact and reconciled matching, ambiguous/duplicate/missing/conflicting identifiers and mappings, all record change types, schema changes, exports (including formula and HTML injection), profiling, fingerprints, significance and movement analytics, and the 100-versus-1,000 positional-index regression. Playwright covers upload, profile, explicit key confirmation, reconciliation and export, Worker failure cleanup, and synthetic 1k/10k/50k/100k comparison benchmarks; install Chromium once with `npx playwright install chromium` if needed. Run the 120 MB worker parse/profile/fingerprint benchmark separately with `RUN_LIMIT_BENCHMARK=1 npm run test:e2e -- --grep "near-limit CSV"`. It is opt-in because it requires substantial browser memory. Browser `performance.memory` snapshots cover the renderer and do not measure Worker memory; results depend on browser and hardware.
+Unit tests cover parsing/validation, detected delimiters and quotes, large cells, data types, exact and reconciled matching, ambiguous/duplicate/missing/conflicting identifiers and mappings, all record change types, schema changes, exports (including formula and HTML injection), profiling, fingerprints, significance and movement analytics, and the 100-versus-1,000 positional-index regression. Playwright covers upload, profile, explicit key confirmation, reconciliation and export, Worker failure cleanup, saved-comparison workflows, and synthetic 1k/10k/50k/100k comparison benchmarks; install Chromium once with `npx playwright install chromium` if needed. Run the 120 MB worker parse/profile/fingerprint benchmark separately with `RUN_LIMIT_BENCHMARK=1 npm run test:e2e -- --grep "near-limit CSV"`. It is opt-in because it requires substantial browser memory. Browser `performance.memory` snapshots cover the renderer and do not measure Worker memory; results depend on browser and hardware.
 
 ## Current limits
 
 - Primary and secondary matching keys are each single columns; composite keys are not supported. Explicit mappings are manual and do not use fuzzy matching.
 - Files are fully read into memory (inside a worker) and transferred as parsed datasets to the UI; fingerprinting and comparison add further allocations. A 120 MB one-column CSV passed the opt-in parse/profile/fingerprint benchmark in the tested Chromium browser, but the full 150 MB limit, two near-limit files, and Worker peak memory were not verified.
+- Saved comparisons duplicate dataset and result structures into IndexedDB and can consume substantial local storage. Browser quota errors are reported; saved comparisons can be deleted individually or removed by clearing site data.
 - Fingerprints are order-sensitive content hashes; the same records in a different row or header order are intentionally different fingerprints.
 - Profiling findings are heuristics, not validation guarantees; ambiguous locale-specific dates and semantic category equivalence require human review.
 - If no complete unique secondary key or reliable manual mapping exists, changed primary IDs remain removals/additions; DriftWatch will not infer identity from fuzzy similarity. A wrong but unique user-confirmed key can still associate different real-world records.

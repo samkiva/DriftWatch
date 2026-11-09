@@ -2,8 +2,8 @@ import { lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } 
 import {
   Activity, ArrowDown, ArrowDownToLine, ArrowLeftRight, ArrowRight, BarChart3, Check,
   ChevronDown, CircleHelp, Columns3, Database, FileCheck2, FileSpreadsheet,
-  FolderOpen, Gauge, Info, LayoutDashboard, LockKeyhole, Menu, Plus, Search, Settings2,
-  ShieldCheck, Sparkles, Upload, X,
+  FolderOpen, Gauge, History, Info, LayoutDashboard, LockKeyhole, Menu, Plus, Search, Settings2,
+  ShieldCheck, Sparkles, Trash2, Upload, X, Save,
 } from "lucide-react";
 import {
   generateInsights,
@@ -12,18 +12,25 @@ import {
 } from "./core/compare";
 import { readCsvFile, type Dataset } from "./core/csv";
 import type { ColumnProfile, DatasetProfile } from "./core/profile";
-import { compareDatasetsInWorker, rankIdentifierCandidatesInWorker } from "./core/worker-client";
+import {
+  compareDatasetsInWorker, rankIdentifierCandidatesInWorker, type WorkerProgress,
+} from "./core/worker-client";
 import { exportDifferencesCsv, exportHtmlReport, exportSummaryCsv } from "./core/export";
+import {
+  deleteSavedComparison, listSavedComparisons, openSavedComparison, saveComparison,
+  type SavedComparisonMetadata,
+} from "./core/saved-comparisons";
 
 const ChangeChart = lazy(() => import("./components/ChangeChart"));
 
-type Screen = "dashboard" | "new" | "results" | "explorer" | "settings";
+type Screen = "dashboard" | "new" | "results" | "explorer" | "saved" | "settings";
 type FileSlot = "baseline" | "newer";
 
 const navItems: Array<{ id: Screen; label: string; icon: typeof LayoutDashboard }> = [
   { id: "dashboard", label: "Overview", icon: LayoutDashboard },
   { id: "new", label: "New comparison", icon: Plus },
   { id: "results", label: "Results", icon: BarChart3 },
+  { id: "saved", label: "Saved comparisons", icon: History },
 ];
 
 const changeColors: Record<string, string> = {
@@ -61,12 +68,37 @@ function App() {
   const [result, setResult] = useState<ComparisonResult | null>(null);
   const [compareError, setCompareError] = useState("");
   const [mobileNav, setMobileNav] = useState(false);
+  const [savedComparisons, setSavedComparisons] = useState<SavedComparisonMetadata[]>([]);
+  const [savedLoading, setSavedLoading] = useState(false);
+  const [savingComparison, setSavingComparison] = useState(false);
+  const [savedError, setSavedError] = useState("");
+  const [savedSuccess, setSavedSuccess] = useState("");
+  const [fileProgress, setFileProgress] = useState<Partial<Record<FileSlot, WorkerProgress>>>({});
+  const [comparisonProgress, setComparisonProgress] = useState<WorkerProgress | null>(null);
+  const fileControllers = useRef<Partial<Record<FileSlot, AbortController>>>({});
+  const comparisonController = useRef<AbortController | null>(null);
 
   const commonColumns = useMemo(
     () => baseline && newer ? baseline.headers.filter((header) => newer.headers.includes(header)) : [],
     [baseline, newer],
   );
   const currentScreen = result && (screen === "results" || screen === "explorer");
+
+  useEffect(() => {
+    if (screen !== "saved") return;
+    let active = true;
+    setSavedLoading(true);
+    listSavedComparisons()
+      .then((items) => { if (active) setSavedComparisons(items); })
+      .catch((error: unknown) => { if (active) setSavedError(error instanceof Error ? error.message : "Could not load saved comparisons."); })
+      .finally(() => { if (active) setSavedLoading(false); });
+    return () => { active = false; };
+  }, [screen]);
+
+  useEffect(() => () => {
+    Object.values(fileControllers.current).forEach((controller) => controller?.abort());
+    comparisonController.current?.abort();
+  }, []);
 
   useEffect(() => {
     if (!baseline || !newer) {
@@ -91,9 +123,17 @@ function App() {
   }, [baseline, newer]);
 
   async function addFile(slot: FileSlot, file: File) {
+    fileControllers.current[slot]?.abort();
+    const controller = new AbortController();
+    fileControllers.current[slot] = controller;
     setProcessingFiles((current) => [...current.filter((item) => item !== slot), slot]);
+    setFileProgress((current) => ({ ...current, [slot]: { stage: "Starting local worker", percent: 3 } }));
     try {
-      const dataset = await readCsvFile(file);
+      const dataset = await readCsvFile(file, {
+        signal: controller.signal,
+        onProgress: (progress) => setFileProgress((current) => ({ ...current, [slot]: progress })),
+      });
+      if (controller.signal.aborted) return;
       if (slot === "baseline") setBaseline(dataset);
       else setNewer(dataset);
       setCompareError("");
@@ -104,14 +144,31 @@ function App() {
       setIdentifierMappings([]);
       setMappingsConfirmed(false);
     } catch (error) {
-      setCompareError(error instanceof Error ? error.message : "The file could not be read.");
+      if (!controller.signal.aborted) {
+        setCompareError(error instanceof Error ? error.message : "The file could not be read.");
+      }
     } finally {
-      setProcessingFiles((current) => current.filter((item) => item !== slot));
+      if (fileControllers.current[slot] === controller) {
+        delete fileControllers.current[slot];
+        setProcessingFiles((current) => current.filter((item) => item !== slot));
+        setFileProgress((current) => {
+          const next = { ...current };
+          delete next[slot];
+          return next;
+        });
+      }
     }
   }
 
+  function cancelFile(slot: FileSlot) {
+    fileControllers.current[slot]?.abort();
+  }
+
   async function runComparison() {
-    if (!baseline || !newer || !identifier) return;
+    if (!baseline || !newer || !identifier || comparisonController.current) return;
+    const controller = new AbortController();
+    comparisonController.current = controller;
+    setComparisonProgress({ stage: "Starting comparison worker", percent: 5 });
     setComparing(true);
     try {
       const comparison = await compareDatasetsInWorker(
@@ -124,14 +181,71 @@ function App() {
           ...(secondaryIdentifier ? { secondaryIdentifier } : {}),
           ...(identifierMappings.length ? { identifierMappings } : {}),
         },
+        {
+          signal: controller.signal,
+          onProgress: setComparisonProgress,
+        },
       );
+      if (controller.signal.aborted) return;
       setResult(comparison);
       setCompareError("");
       setScreen("results");
     } catch (error) {
-      setCompareError(error instanceof Error ? error.message : "Comparison failed.");
+      if (!controller.signal.aborted) {
+        setCompareError(error instanceof Error ? error.message : "Comparison failed.");
+      }
     } finally {
-      setComparing(false);
+      if (comparisonController.current === controller) {
+        comparisonController.current = null;
+        setComparing(false);
+        setComparisonProgress(null);
+      }
+    }
+  }
+
+  function cancelComparison() {
+    comparisonController.current?.abort();
+  }
+
+  async function saveCurrentComparison() {
+    if (!result || savingComparison) return;
+    setSavingComparison(true);
+    setSavedError("");
+    setSavedSuccess("");
+    try {
+      const metadata = await saveComparison(result);
+      setSavedComparisons((current) => [metadata, ...current]);
+      setSavedSuccess("Saved on this device. Your data stays in this browser.");
+    } catch (error) {
+      setSavedError(error instanceof Error ? error.message : "Could not save this comparison on this device.");
+    } finally {
+      setSavingComparison(false);
+    }
+  }
+
+  async function openSaved(metadata: SavedComparisonMetadata) {
+    setSavedError("");
+    try {
+      const storedResult = await openSavedComparison(metadata.id);
+      setBaseline(storedResult.baseline);
+      setNewer(storedResult.newer);
+      setIdentifier(storedResult.identifier);
+      setIdentifierConfirmed(true);
+      setResult(storedResult);
+      setSavedSuccess("");
+      setScreen("results");
+    } catch (error) {
+      setSavedError(error instanceof Error ? error.message : "Could not open this saved comparison.");
+    }
+  }
+
+  async function removeSaved(metadata: SavedComparisonMetadata) {
+    setSavedError("");
+    try {
+      await deleteSavedComparison(metadata.id);
+      setSavedComparisons((current) => current.filter((item) => item.id !== metadata.id));
+    } catch (error) {
+      setSavedError(error instanceof Error ? error.message : "Could not delete this saved comparison.");
     }
   }
 
@@ -187,7 +301,7 @@ function App() {
       <main className="main-area">
         <header className="topbar">
           <button className="mobile-menu icon-button" aria-label="Open navigation" onClick={() => setMobileNav((open) => !open)}><Menu size={19} /></button>
-          <div className="breadcrumbs"><span>Workspace</span><span className="breadcrumb-sep">/</span><strong>{screen === "new" ? "New comparison" : screen === "results" ? "Comparison results" : screen === "explorer" ? "Difference explorer" : screen === "settings" ? "Settings" : "Overview"}</strong></div>
+          <div className="breadcrumbs"><span>Workspace</span><span className="breadcrumb-sep">/</span><strong>{screen === "new" ? "New comparison" : screen === "results" ? "Comparison results" : screen === "explorer" ? "Difference explorer" : screen === "saved" ? "Saved comparisons" : screen === "settings" ? "Settings" : "Overview"}</strong></div>
           <div className="topbar-right"><span className="local-badge"><span /> LOCAL & PRIVATE</span><button className="icon-button help-button" aria-label="About DriftWatch" onClick={() => setScreen("settings")}><CircleHelp size={17} /></button></div>
         </header>
 
@@ -208,9 +322,13 @@ function App() {
               mappingsConfirmed={mappingsConfirmed}
               fieldSignificance={fieldSignificance}
               processingFiles={processingFiles}
+              fileProgress={fileProgress}
               comparing={comparing}
+              comparisonProgress={comparisonProgress}
               error={compareError}
               onFile={addFile}
+              onCancelFile={cancelFile}
+              onCancelComparison={cancelComparison}
               onIdentifier={(value) => {
                 setIdentifier(value);
                 setIdentifierConfirmed(false);
@@ -232,8 +350,21 @@ function App() {
             />
           )}
           {currentScreen && result && (
-            <Results result={result} screen={screen} onScreen={setScreen} />
+            <Results
+              result={result}
+              screen={screen}
+              onScreen={setScreen}
+              onSave={saveCurrentComparison}
+              saving={savingComparison}
+              saved={savedComparisons.some((item) =>
+                item.baselineFingerprint === (result.baseline.fingerprint ?? "")
+                && item.newerFingerprint === (result.newer.fingerprint ?? "")
+                && item.identifier === result.identifier)}
+              saveMessage={savedSuccess}
+              saveError={savedError}
+            />
           )}
+          {screen === "saved" && <SavedComparisons items={savedComparisons} loading={savedLoading} error={savedError} onOpen={openSaved} onDelete={removeSaved} />}
           {screen === "settings" && <Settings />}
         </div>
       </main>
@@ -276,19 +407,24 @@ function Feature({ icon, number, title, text }: { icon: ReactNode; number: strin
   return <article className="feature-card"><div className="feature-top"><span className="feature-icon">{icon}</span><span>{number}</span></div><h3>{title}</h3><p>{text}</p></article>;
 }
 
-function UploadCard({ slot, title, subtitle, dataset, loading, onFile }: { slot: FileSlot; title: string; subtitle: string; dataset: Dataset | null; loading: boolean; onFile: (slot: FileSlot, file: File) => void }) {
+function UploadCard({ slot, title, subtitle, dataset, loading, progress, disabled, onFile, onCancel }: {
+  slot: FileSlot; title: string; subtitle: string; dataset: Dataset | null; loading: boolean;
+  progress?: WorkerProgress; disabled: boolean; onFile: (slot: FileSlot, file: File) => void;
+  onCancel: (slot: FileSlot) => void;
+}) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
   return (
     <div className={`upload-card ${dataset ? "upload-complete" : ""}`}>
       <div className="upload-title-row"><div className={`slot-number ${dataset ? "slot-done" : ""}`}>{dataset ? <Check size={14} /> : slot === "baseline" ? "01" : "02"}</div><div><h3>{title}</h3><p>{subtitle}</p></div></div>
       {dataset ? (
-        <div className="file-loaded"><span className="loaded-icon"><FileSpreadsheet size={19} /></span><div className="loaded-info"><strong title={dataset.name}>{dataset.name}</strong><span>{formatNumber(dataset.rows.length)} rows <i /> {dataset.headers.length} columns <i /> {Object.values(dataset.types).filter((type) => type === "number").length} numeric</span></div><button className="icon-button file-replace" title="Replace file" disabled={loading} onClick={() => inputRef.current?.click()}><Upload size={15} /></button></div>
+        <div className="file-loaded"><span className="loaded-icon"><FileSpreadsheet size={19} /></span><div className="loaded-info"><strong title={dataset.name}>{dataset.name}</strong><span>{formatNumber(dataset.rows.length)} rows <i /> {dataset.headers.length} columns <i /> {Object.values(dataset.types).filter((type) => type === "number").length} numeric</span></div><button className="icon-button file-replace" title="Replace file" disabled={loading || disabled} onClick={() => inputRef.current?.click()}><Upload size={15} /></button></div>
       ) : (
-        <button className={`drop-zone ${dragging ? "drag-active" : ""}`} disabled={loading} onClick={() => inputRef.current?.click()} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); const file = event.dataTransfer.files[0]; if (file) onFile(slot, file); }}>
-          <span className="upload-icon">{loading ? <Activity size={19} className="processing-spin" /> : <Upload size={19} />}</span><span className="drop-copy"><strong>{loading ? "Processing locally…" : <>Drop your CSV here, or <em>browse</em></>}</strong><small>{loading ? "Profiling and fingerprinting in a background worker" : "CSV files only · up to 150 MB"}</small></span><ArrowDown size={15} className="drop-arrow" />
+        <button className={`drop-zone ${dragging ? "drag-active" : ""}`} disabled={loading || disabled} onClick={() => inputRef.current?.click()} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); const file = event.dataTransfer.files[0]; if (file) onFile(slot, file); }}>
+          <span className="upload-icon">{loading ? <Activity size={19} className="processing-spin" /> : <Upload size={19} />}</span><span className="drop-copy"><strong>{loading ? "Processing locally…" : <>Drop your CSV here, or <em>browse</em></>}</strong><small>{loading ? progress?.stage ?? "Working in a background worker" : "CSV files only · up to 150 MB"}</small></span><ArrowDown size={15} className="drop-arrow" />
         </button>
       )}
+      {loading && <div className="worker-progress" role="status"><div><span>{progress?.stage ?? "Working in background"}</span><strong>{progress?.percent ?? 0}%</strong></div><progress max="100" value={progress?.percent ?? 0} /><button className="text-button" onClick={() => onCancel(slot)}>Cancel</button></div>}
       <input ref={inputRef} className="visually-hidden" type="file" accept=".csv,text/csv" onChange={(event) => { const file = event.target.files?.[0]; if (file) onFile(slot, file); event.currentTarget.value = ""; }} />
       {dataset && <div className="type-list">{dataset.headers.slice(0, 5).map((header) => <span key={header}>{header}<small>{dataset.types[header]}</small></span>)}{dataset.headers.length > 5 && <span className="more-types">+{dataset.headers.length - 5} more</span>}</div>}
       {dataset?.fingerprint && <div className="fingerprint-value" title={dataset.fingerprint}>SHA-256 · {dataset.fingerprint.slice(0, 16)}…</div>}
@@ -345,13 +481,15 @@ function QualityFindings({ profile }: { profile: ColumnProfile }) {
   return labels.length ? <span className="quality-finding">{labels.join(" · ")}</span> : <span className="quality-none">—</span>;
 }
 
-function NewComparison({ baseline, newer, identifier, commonColumns, identifierCandidates, analyzingIdentifiers, identifierConfirmed, secondaryIdentifier, secondaryConfirmed, identifierMappings, mappingsConfirmed, fieldSignificance, processingFiles, comparing, error, onFile, onIdentifier, onConfirmIdentifier, onSecondaryIdentifier, onConfirmSecondary, onIdentifierMappings, onConfirmMappings, onFieldSignificance, onCompare }: {
+function NewComparison({ baseline, newer, identifier, commonColumns, identifierCandidates, analyzingIdentifiers, identifierConfirmed, secondaryIdentifier, secondaryConfirmed, identifierMappings, mappingsConfirmed, fieldSignificance, processingFiles, fileProgress, comparing, comparisonProgress, error, onFile, onCancelFile, onCancelComparison, onIdentifier, onConfirmIdentifier, onSecondaryIdentifier, onConfirmSecondary, onIdentifierMappings, onConfirmMappings, onFieldSignificance, onCompare }: {
   baseline: Dataset | null; newer: Dataset | null; identifier: string; commonColumns: string[];
   identifierCandidates: IdentifierCandidate[]; analyzingIdentifiers: boolean; identifierConfirmed: boolean;
   secondaryIdentifier: string; secondaryConfirmed: boolean;
   identifierMappings: Array<{ before: string; after: string }>; mappingsConfirmed: boolean;
-  fieldSignificance: Record<string, ChangeSignificance>; processingFiles: FileSlot[]; comparing: boolean;
+  fieldSignificance: Record<string, ChangeSignificance>; processingFiles: FileSlot[];
+  fileProgress: Partial<Record<FileSlot, WorkerProgress>>; comparing: boolean; comparisonProgress: WorkerProgress | null;
   error: string; onFile: (slot: FileSlot, file: File) => void; onIdentifier: (id: string) => void;
+  onCancelFile: (slot: FileSlot) => void; onCancelComparison: () => void;
   onConfirmIdentifier: (confirmed: boolean) => void;
   onSecondaryIdentifier: (id: string) => void; onConfirmSecondary: (confirmed: boolean) => void;
   onIdentifierMappings: (mappings: Array<{ before: string; after: string }>) => void;
@@ -378,9 +516,9 @@ function NewComparison({ baseline, newer, identifier, commonColumns, identifierC
     <>
       <div className="page-heading"><div><div className="eyebrow"><span className="eyebrow-line" /> YOUR NEXT INSIGHT STARTS HERE</div><h1>New comparison</h1><p>Choose two snapshots and a stable key to track each record.</p></div><div className="step-indicator"><span className="step-active">1 <small>Upload</small></span><i /><span>2 <small>Compare</small></span><i /><span>3 <small>Explore</small></span></div></div>
       <div className="upload-grid">
-        <UploadCard slot="baseline" title="Baseline dataset" subtitle="Your earlier snapshot" dataset={baseline} loading={processingFiles.includes("baseline")} onFile={onFile} />
+        <UploadCard slot="baseline" title="Baseline dataset" subtitle="Your earlier snapshot" dataset={baseline} loading={processingFiles.includes("baseline")} progress={fileProgress.baseline} disabled={comparing} onFile={onFile} onCancel={onCancelFile} />
         <div className="upload-connector"><ArrowLeftRight size={17} /></div>
-        <UploadCard slot="newer" title="Newer dataset" subtitle="The version you want to check" dataset={newer} loading={processingFiles.includes("newer")} onFile={onFile} />
+        <UploadCard slot="newer" title="Newer dataset" subtitle="The version you want to check" dataset={newer} loading={processingFiles.includes("newer")} progress={fileProgress.newer} disabled={comparing} onFile={onFile} onCancel={onCancelFile} />
       </div>
       {baseline && newer && baseline.fingerprint && baseline.fingerprint === newer.fingerprint && (
         <div className="identical-datasets" role="status"><Check size={15} /> These files contain identical data (SHA-256 fingerprints match), regardless of filename.</div>
@@ -450,12 +588,15 @@ function NewComparison({ baseline, newer, identifier, commonColumns, identifierC
         </section>
       )}
       {error && <div className="error-banner" role="alert"><X size={16} /><span>{error}</span></div>}
-      <div className="comparison-footer"><div className="privacy-reminder"><LockKeyhole size={15} /><span><strong>100% local processing</strong><small>Your files stay in this browser and are cleared when you start a new comparison.</small></span></div><button className="button button-primary" disabled={!ready || comparing || processingFiles.length > 0} onClick={onCompare}>{comparing ? <>Comparing in background… <Activity size={15} className="processing-spin" /></> : <>Compare datasets <ArrowRight size={16} /></>}</button></div>
+      <div className="comparison-footer"><div className="privacy-reminder"><LockKeyhole size={15} /><span><strong>100% local processing</strong><small>Your files stay in this browser unless you explicitly save a comparison.</small></span></div>{comparing ? <div className="comparison-progress" role="status"><div><span>{comparisonProgress?.stage ?? "Comparing in background"}</span><strong>{comparisonProgress?.percent ?? 0}%</strong></div><progress max="100" value={comparisonProgress?.percent ?? 0} /><button className="text-button" onClick={onCancelComparison}>Cancel comparison</button></div> : <button className="button button-primary" disabled={!ready || processingFiles.length > 0} onClick={onCompare}>Compare datasets <ArrowRight size={16} /></button>}</div>
     </>
   );
 }
 
-function Results({ result, screen, onScreen }: { result: ComparisonResult; screen: Screen; onScreen: (screen: Screen) => void }) {
+function Results({ result, screen, onScreen, onSave, saving, saved, saveMessage, saveError }: {
+  result: ComparisonResult; screen: Screen; onScreen: (screen: Screen) => void;
+  onSave: () => void; saving: boolean; saved: boolean; saveMessage: string; saveError: string;
+}) {
   const [filter, setFilter] = useState("all");
   const [search, setSearch] = useState("");
   const [sortColumn, setSortColumn] = useState(result.identifier);
@@ -509,7 +650,9 @@ function Results({ result, screen, onScreen }: { result: ComparisonResult; scree
 
   return (
     <>
-      <div className="result-heading"><div><div className="eyebrow"><span className="eyebrow-line" /> COMPARISON COMPLETE</div><h1>Change, made clear.</h1><p><span className="file-name-inline">{result.baseline.name}</span><ArrowRight size={13} /><span className="file-name-inline">{result.newer.name}</span><span className="heading-divider">·</span> matched by <strong>{result.identifier}</strong></p></div><div className="export-menu"><details><summary className="button button-secondary"><ArrowDownToLine size={16} /> Export <ChevronDown size={14} /></summary><div className="export-options"><button onClick={() => exportWith("csv")}>Detailed differences CSV</button><button onClick={() => exportWith("csv", "summary")}>Summary CSV</button><button onClick={() => exportWith("html")}>Self-contained HTML report</button></div></details></div></div>
+      <div className="result-heading"><div><div className="eyebrow"><span className="eyebrow-line" /> COMPARISON COMPLETE</div><h1>Change, made clear.</h1><p><span className="file-name-inline">{result.baseline.name}</span><ArrowRight size={13} /><span className="file-name-inline">{result.newer.name}</span><span className="heading-divider">·</span> matched by <strong>{result.identifier}</strong></p></div><div className="result-actions"><button className="button button-secondary save-comparison-button" onClick={onSave} disabled={saving || saved}>{saved ? <Check size={15} /> : <Save size={15} />}{saving ? "Saving locally…" : saved ? "Saved on this device" : "Save comparison"}</button><div className="export-menu"><details><summary className="button button-secondary"><ArrowDownToLine size={16} /> Export <ChevronDown size={14} /></summary><div className="export-options"><button onClick={() => exportWith("csv")}>Detailed differences CSV</button><button onClick={() => exportWith("csv", "summary")}>Summary CSV</button><button onClick={() => exportWith("html")}>Self-contained HTML report</button></div></details></div></div></div>
+      {saveMessage && <div className="save-status" role="status"><Check size={14} />{saveMessage}</div>}
+      {saveError && <div className="error-banner" role="alert"><X size={16} /><span>{saveError}</span></div>}
       <div className="result-tabs"><button className={!isExplorer ? "tab-active" : ""} onClick={() => onScreen("results")}>Overview</button><button className={isExplorer ? "tab-active" : ""} onClick={() => onScreen("explorer")}>Difference explorer <span>{formatNumber(result.records.length)}</span></button></div>
       <section className={`result-key-check ${result.identifierAnalysis.warnings.length ? "result-key-warning" : ""}`}>
         <div><strong>Matched by {result.identifier}</strong><span>{formatNumber(result.identifierAnalysis.sharedValues)} shared values · {formatNumber(result.identifierAnalysis.baseline.uniqueValues)} baseline unique · {formatNumber(result.identifierAnalysis.newer.uniqueValues)} newer unique</span></div>
@@ -558,6 +701,29 @@ function Results({ result, screen, onScreen }: { result: ComparisonResult; scree
   );
 }
 
+function SavedComparisons({ items, loading, error, onOpen, onDelete }: {
+  items: SavedComparisonMetadata[]; loading: boolean; error: string;
+  onOpen: (item: SavedComparisonMetadata) => void; onDelete: (item: SavedComparisonMetadata) => void;
+}) {
+  return (
+    <>
+      <div className="page-heading"><div><div className="eyebrow"><span className="eyebrow-line" /> PRIVATE TO THIS BROWSER</div><h1>Saved comparisons</h1><p>Your saved datasets stay in this browser’s IndexedDB and are not uploaded.</p></div></div>
+      {error && <div className="error-banner" role="alert"><X size={16} /><span>{error}</span></div>}
+      {loading ? <div className="saved-empty"><Activity size={18} className="processing-spin" /> Reading local comparisons…</div>
+        : items.length ? <div className="saved-list">{items.map((item) => (
+          <article className="saved-item" key={item.id}>
+            <span className="saved-item-icon"><FileCheck2 size={18} /></span>
+            <div className="saved-item-copy"><strong>{item.baselineName} <ArrowRight size={13} /> {item.newerName}</strong><span>Matched by {item.identifier} · Saved {new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(item.savedAt)}</span></div>
+            <button className="button button-secondary" onClick={() => onOpen(item)}>Open</button>
+            <button className="icon-button saved-delete" aria-label={`Delete saved comparison ${item.baselineName}`} title="Delete from this device" onClick={() => onDelete(item)}><Trash2 size={15} /></button>
+          </article>
+        ))}</div>
+          : <div className="saved-empty"><History size={22} /><strong>No saved comparisons yet</strong><span>Save a result to keep a private copy on this device for next time.</span></div>}
+      <p className="saved-privacy"><LockKeyhole size={13} /> Saved comparisons remain in this browser until you delete them or clear site data. They are never sent to DriftWatch servers.</p>
+    </>
+  );
+}
+
 function MetricCard({ label, value, detail, icon, tone }: { label: string; value: number; detail: string; icon: ReactNode; tone: string }) {
   return <div className={`metric-card metric-${tone}`}><div className="metric-card-top"><span>{label}</span><i>{icon}</i></div><strong>{formatNumber(value)}</strong><small>{detail}</small></div>;
 }
@@ -594,7 +760,7 @@ function Settings() {
   return (
     <>
       <div className="page-heading"><div><div className="eyebrow"><span className="eyebrow-line" /> TRANSPARENT BY DESIGN</div><h1>Settings & about</h1><p>A little context on how DriftWatch handles your data.</p></div></div>
-      <section className="panel settings-panel"><div className="settings-title"><span className="settings-icon"><ShieldCheck size={19} /></span><div><h2>Privacy is the default</h2><p>DriftWatch is a client-side tool. It does not have a backend or send your CSV contents anywhere.</p></div></div><div className="settings-list"><div><LockKeyhole size={16} /><span><strong>Local processing</strong><small>CSV parsing, comparison, and report generation happen entirely in this browser.</small></span><span className="settings-state"><i /> Always on</span></div><div><Database size={16} /><span><strong>In-memory data</strong><small>Uploaded files are held only in the current page session, not stored persistently.</small></span><span className="settings-state"><i /> Session only</span></div><div><Sparkles size={16} /><span><strong>Deterministic insights</strong><small>Every observation is generated from the comparison results. No AI API or key required.</small></span><span className="settings-state"><i /> No API</span></div></div></section>
+      <section className="panel settings-panel"><div className="settings-title"><span className="settings-icon"><ShieldCheck size={19} /></span><div><h2>Privacy is the default</h2><p>DriftWatch is a client-side tool. It does not have a backend or send your CSV contents anywhere.</p></div></div><div className="settings-list"><div><LockKeyhole size={16} /><span><strong>Local processing</strong><small>CSV parsing, comparison, and report generation happen entirely in this browser.</small></span><span className="settings-state"><i /> Always on</span></div><div><Database size={16} /><span><strong>Memory by default</strong><small>Uploads stay in page memory unless you explicitly save a comparison. Saved copies remain on this device until deleted or site data is cleared.</small></span><span className="settings-state"><i /> Local only</span></div><div><Sparkles size={16} /><span><strong>Deterministic insights</strong><small>Every observation is generated from the comparison results. No AI API or key required.</small></span><span className="settings-state"><i /> No API</span></div></div></section>
       <section className="panel about-panel"><div><h2>About DriftWatch</h2><p>CSV change intelligence for people who care about what changed — and where their data goes.</p></div><span className="about-version">VERSION 1.0.0 · MVP</span></section>
       <div className="footnote"><Info size={13} /><span>Very large files can use significant browser memory. The current file-size limit is 150 MB.</span></div>
     </>

@@ -38,7 +38,7 @@ test("fingerprints recognize identical parsed data independently of file names",
   await page.getByRole("button", { name: /New comparison/ }).first().click();
   await page.locator('input[type="file"]').nth(0).setInputFiles({ name: "original.csv", mimeType: "text/csv", buffer: contents });
   await page.locator('input[type="file"]').nth(1).setInputFiles({ name: "renamed-copy.csv", mimeType: "text/csv", buffer: contents });
-  await expect(page.getByRole("status")).toContainText(/identical data.*fingerprints match/i);
+  await expect(page.locator(".identical-datasets")).toContainText(/identical data.*fingerprints match/i);
 });
 
 test("benchmarks main-thread processing against workers on 10k-row datasets", async ({ page }) => {
@@ -335,4 +335,108 @@ test("requires explicit confirmation before applying old-to-new identifier mappi
   await page.getByRole("button", { name: "Compare datasets" }).click();
   await expect(page.getByText(/1 primary identifier change was linked/i)).toBeVisible();
   await expect(page.locator(".significance-critical").first()).toBeVisible();
+});
+
+test("saves, reloads, reopens, and deletes a comparison locally", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => new Promise<void>((resolve, reject) => {
+    const request = indexedDB.deleteDatabase("driftwatch-local");
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  }));
+  await page.getByRole("button", { name: /New comparison/ }).first().click();
+  await page.locator('input[type="file"]').nth(0).setInputFiles({
+    name: "saved-before.csv",
+    mimeType: "text/csv",
+    buffer: Buffer.from("id,value\n1,old"),
+  });
+  await page.locator('input[type="file"]').nth(1).setInputFiles({
+    name: "saved-after.csv",
+    mimeType: "text/csv",
+    buffer: Buffer.from("id,value\n1,new"),
+  });
+  await page.getByLabel("Unique record identifier").selectOption("id");
+  await page.getByRole("checkbox", { name: /I reviewed these counts/ }).check();
+  await page.getByRole("button", { name: "Compare datasets" }).click();
+  await expect(page.getByRole("heading", { name: "Change, made clear." })).toBeVisible();
+  await page.getByRole("button", { name: "Save comparison" }).click();
+  await expect(page.getByRole("button", { name: "Saved on this device" })).toBeVisible();
+  await page.getByRole("button", { name: /Saved comparisons/ }).click();
+  await expect(page.getByText("saved-before.csv")).toBeVisible();
+
+  await page.reload();
+  await page.getByRole("button", { name: /Saved comparisons/ }).click();
+  await expect(page.getByText("saved-before.csv")).toBeVisible();
+  await page.getByRole("button", { name: "Open" }).click();
+  await expect(page.getByRole("heading", { name: "Change, made clear." })).toBeVisible();
+  await expect(page.locator(".result-heading .file-name-inline").first()).toHaveText("saved-before.csv");
+  await page.getByRole("button", { name: /Saved comparisons/ }).click();
+  await page.getByRole("button", { name: "Delete saved comparison saved-before.csv" }).click();
+  await expect(page.getByText("No saved comparisons yet")).toBeVisible();
+});
+
+test("cancels a pending file worker and cleans up its progress state", async ({ page }) => {
+  await page.addInitScript(() => {
+    const NativeWorker = window.Worker;
+    let terminated = 0;
+    class PendingWorker extends NativeWorker {
+      postMessage() {}
+      terminate() {
+        terminated += 1;
+        super.terminate();
+      }
+    }
+    window.Worker = PendingWorker;
+    Object.defineProperty(window, "__workerTerminations", { get: () => terminated });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: /New comparison/ }).first().click();
+  await page.locator('input[type="file"]').nth(0).setInputFiles({
+    name: "pending.csv",
+    mimeType: "text/csv",
+    buffer: Buffer.from("id,value\n1,pending"),
+  });
+  await page.getByRole("button", { name: "Cancel" }).click();
+  await expect(page.getByRole("button", { name: "Cancel" })).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => (window as Window & { __workerTerminations?: number }).__workerTerminations)).toBe(1);
+  await expect(page.getByRole("alert")).toHaveCount(0);
+});
+
+test("cancels a pending comparison worker", async ({ page }) => {
+  await page.addInitScript(() => {
+    const NativeWorker = window.Worker;
+    let terminated = 0;
+    class PendingComparisonWorker extends NativeWorker {
+      postMessage(message: unknown) {
+        if ((message as { type?: string }).type !== "compare") {
+          super.postMessage(message);
+        }
+      }
+      terminate() {
+        terminated += 1;
+        super.terminate();
+      }
+    }
+    window.Worker = PendingComparisonWorker;
+    Object.defineProperty(window, "__workerTerminations", { get: () => terminated });
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: /New comparison/ }).first().click();
+  await page.locator('input[type="file"]').nth(0).setInputFiles({
+    name: "before.csv",
+    mimeType: "text/csv",
+    buffer: Buffer.from("id,value\n1,old"),
+  });
+  await page.locator('input[type="file"]').nth(1).setInputFiles({
+    name: "after.csv",
+    mimeType: "text/csv",
+    buffer: Buffer.from("id,value\n1,new"),
+  });
+  await page.getByLabel("Unique record identifier").selectOption("id");
+  await page.getByRole("checkbox", { name: /I reviewed these counts/ }).check();
+  await page.getByRole("button", { name: "Compare datasets" }).click();
+  await page.getByRole("button", { name: "Cancel comparison" }).click();
+  await expect(page.getByRole("button", { name: "Compare datasets" })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => (window as Window & { __workerTerminations?: number }).__workerTerminations)).toBe(4);
+  await expect(page.getByRole("alert")).toHaveCount(0);
 });
